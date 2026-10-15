@@ -1,13 +1,15 @@
 name: publish
 
 # Publishes abcdesign.app: the brief-session page abcd writes with
-# `abcd session page`, built from the latest abcd release, checksum- and
-# attestation-verified, then deployed to this repository's GitHub Pages.
-# The page's source lives in intentdriven/abcd; this repository holds only
-# this workflow. It uses no secret beyond the run's own token.
+# `abcd session page`, built from abcd's highest stable release, checked
+# against the release's provenance, then deployed to this repository's
+# GitHub Pages. The page's source lives in intentdriven/abcd; this
+# repository holds only this workflow. It uses no secret beyond the run's
+# own token.
 #
-# A release that does not yet carry `abcd session page` publishes nothing:
-# the build says so and the deploy job is skipped.
+# Until abcd's first release carrying `abcd session page`, a run publishes
+# nothing and says so; from that release on, a release without the verb
+# fails the run, so a broken page never goes quietly stale.
 
 on:
   schedule:
@@ -20,38 +22,62 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  # The first abcd release expected to carry `abcd session page`. Before
+  # it, a release without the verb publishes nothing; from it on, a release
+  # without the verb is an error. Set when that release is cut.
+  FIRST_SESSION_RELEASE: v0.17.0
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
       ready: ${{ steps.page.outputs.ready }}
     steps:
-      - name: Download the latest abcd release and its checksums
+      - name: Choose abcd's highest stable release
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag=$(gh release view --repo intentdriven/abcd --json tagName --jq .tagName)
-          case "$tag" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::unexpected release tag: $tag"; exit 1 ;;
-          esac
+          # The highest version among published, non-pre-release releases,
+          # not the release marked "latest", which can be re-marked.
+          tag=$(gh release list --repo intentdriven/abcd --exclude-drafts --exclude-pre-releases \
+            --limit 200 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::no stable abcd release found"
+            exit 1
+          fi
+          commit=$(gh api "repos/intentdriven/abcd/commits/${tag}" --jq .sha)
+          if ! printf '%s' "$commit" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::could not resolve the commit of abcd $tag"
+            exit 1
+          fi
           gh release download "$tag" --repo intentdriven/abcd \
             --pattern 'abcd-linux-amd64' --pattern 'checksums.txt' --dir "$RUNNER_TEMP"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
-      - name: Verify abcd against its release manifest and its provenance
+      - name: Verify abcd against its provenance
         env:
           GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ steps.release.outputs.commit }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
+          # Integrity only: the checksums come from the same release.
           grep ' abcd-linux-amd64$' checksums.txt | sha256sum -c -
+          # Authenticity: built by abcd's release workflow from main, on
+          # GitHub's own runners, from exactly the tagged commit.
           gh attestation verify abcd-linux-amd64 --repo intentdriven/abcd \
-            --signer-workflow intentdriven/abcd/.github/workflows/release.yml
+            --cert-identity https://github.com/intentdriven/abcd/.github/workflows/release.yml@refs/heads/main \
+            --source-ref refs/heads/main \
+            --source-digest "$COMMIT" \
+            --deny-self-hosted-runners
           install -m 0755 abcd-linux-amd64 "${RUNNER_TEMP}/abcd"
 
       - name: Render the page
@@ -62,7 +88,13 @@ jobs:
           set -euo pipefail
           # An abcd without the verb answers --help with its general help and
           # exits 0, so the verb is known by its own usage line instead.
-          if ! "${RUNNER_TEMP}/abcd" session page --help 2>/dev/null | grep -q '^  abcd session page'; then
+          help=$("${RUNNER_TEMP}/abcd" session page --help 2>/dev/null || true)
+          if ! printf '%s\n' "$help" | grep -q '^  abcd session page'; then
+            first=$(printf '%s\n%s\n' "$FIRST_SESSION_RELEASE" "$TAG" | sort -V | head -n 1)
+            if [ "$first" = "$FIRST_SESSION_RELEASE" ]; then
+              echo "::error::abcd $TAG should carry abcd session page and does not"
+              exit 1
+            fi
             echo "::notice::abcd $TAG does not carry abcd session page yet, so nothing is published"
             echo "ready=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -80,6 +112,7 @@ jobs:
     needs: build
     if: needs.build.outputs.ready == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       pages: write
       id-token: write
