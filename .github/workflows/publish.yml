@@ -60,7 +60,9 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          if ! "${RUNNER_TEMP}/abcd" session page --help >/dev/null 2>&1; then
+          # An abcd without the verb answers --help with its general help and
+          # exits 0, so the verb is known by its own usage line instead.
+          if ! "${RUNNER_TEMP}/abcd" session page --help 2>/dev/null | grep -q '^  abcd session page'; then
             echo "::notice::abcd $TAG does not carry abcd session page yet, so nothing is published"
             echo "ready=false" >> "$GITHUB_OUTPUT"
             exit 0
